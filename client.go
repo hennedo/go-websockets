@@ -4,7 +4,7 @@
 
 // This code is largely copied from the Gorilla Websocket examples.. Some modifications were made :)
 
-package main
+package go-websockets 
 
 import (
 	"bytes"
