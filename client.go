@@ -4,14 +4,14 @@
 
 // This code is largely copied from the Gorilla Websocket examples.. Some modifications were made :)
 
-package go-websockets 
+package go_websockets
 
 import (
 	"bytes"
 	"encoding/json"
-	"github.com/sirupsen/logrus"
-	"strings"
 	"time"
+
+	"github.com/sirupsen/logrus"
 
 	"github.com/gorilla/websocket"
 )
@@ -32,16 +32,12 @@ type Client struct {
 	hub  *Hub
 	conn *websocket.Conn
 	send chan []byte
-	id   int
+	id   uint64
 }
 
 type RawMessage struct {
-	Type string
-	Args json.RawMessage
-}
-type Message struct {
-	Type string `json:"type"`
-	Args interface{} `json:"args"`
+	Type string          `json:"type"`
+	Args json.RawMessage `json:"args"`
 }
 
 // readPump pumps messages from the websocket connection to the hub.
@@ -52,10 +48,19 @@ type Message struct {
 func (c *Client) readPump() {
 	defer func() {
 		c.hub.unregister <- c.id
-		c.conn.Close()
 	}()
-	c.conn.SetReadDeadline(time.Now().Add(pongWait))
-	c.conn.SetPongHandler(func(string) error { c.conn.SetReadDeadline(time.Now().Add(pongWait)); return nil })
+	defer c.conn.Close()
+
+	if err := c.conn.SetReadDeadline(time.Now().Add(pongWait)); err != nil {
+		logrus.Tracef("failed setting read deadline: %v", err)
+	}
+	c.conn.SetPongHandler(func(string) error {
+		if err := c.conn.SetReadDeadline(time.Now().Add(pongWait)); err != nil {
+			logrus.Tracef("failed setting read deadline: %v", err)
+		}
+		return nil
+	})
+
 	for {
 		logrus.Tracef("start for loop for client %d", c.id)
 		_, message, err := c.conn.ReadMessage()
@@ -63,14 +68,15 @@ func (c *Client) readPump() {
 			logrus.Errorf("error: %v", err)
 			break
 		}
+
 		var msg RawMessage
-		err = json.NewDecoder(strings.NewReader(string(message))).Decode(&msg)
+		err = json.NewDecoder(bytes.NewReader(message)).Decode(&msg)
 		if err != nil {
 			logrus.Error(err)
 		}
-		s, _ := msg.Args.MarshalJSON()
+
 		logrus.Tracef("New Message '%s' from client %d", msg.Type, c.id)
-		c.hub.Handle(c, msg.Type, string(s))
+		c.hub.Handle(c, msg.Type, msg.Args)
 		logrus.Tracef("New Message '%s' from client %d handled", msg.Type, c.id)
 	}
 }
@@ -82,53 +88,63 @@ func (c *Client) readPump() {
 // executing all writes from this goroutine.
 func (c *Client) writePump() {
 	ticker := time.NewTicker(pingPeriod)
-	defer func() {
-		ticker.Stop()
-		c.conn.Close()
-	}()
+	defer ticker.Stop()
+	defer c.conn.Close()
+
 	for {
 		select {
 		case message, ok := <-c.send:
-			c.conn.SetWriteDeadline(time.Now().Add(writeWait))
 			if !ok {
 				// The hub closed the channel.
-				c.conn.WriteMessage(websocket.CloseMessage, []byte{})
+				_ = c.conn.WriteMessage(websocket.CloseMessage, []byte{})
 				return
 			}
 
 			w, err := c.conn.NextWriter(websocket.TextMessage)
 			if err != nil {
+				logrus.Tracef("failed getting next writer: %v", err)
 				return
 			}
-			w.Write(message)
+
+			if err := c.conn.SetWriteDeadline(time.Now().Add(writeWait)); err != nil {
+				logrus.Tracef("failed setting write deadline: %v", err)
+				return
+			}
+
+			_, _ = w.Write(message)
 
 			if err := w.Close(); err != nil {
+				logrus.Tracef("failed closing conn: %v", err)
 				return
 			}
 		case <-ticker.C:
-			c.conn.SetWriteDeadline(time.Now().Add(writeWait))
+			if err := c.conn.SetWriteDeadline(time.Now().Add(writeWait)); err != nil {
+				logrus.Tracef("failed setting write deadline: %v", err)
+				return
+			}
+
 			if err := c.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+				logrus.Tracef("failed writing message: %v", err)
 				return
 			}
 		}
 	}
 }
 
-func (c *Client) WriteMessage(msg string) error {
-	c.send <- []byte(msg)
-	return nil
-}
-
-func (c *Client) WriteJSON(name string, args interface{}) error {
-	var buf bytes.Buffer
-	msg := Message{
+func (c *Client) WriteJSON(name string, args interface{}) (err error) {
+	msg := RawMessage{
 		Type: name,
 	}
-	msg.Args = args
-	err := json.NewEncoder(&buf).Encode(msg)
+	msg.Args, err = json.Marshal(args)
 	if err != nil {
 		return err
 	}
-	c.send <- buf.Bytes()
+
+	msgBytes, err := json.Marshal(msg)
+	if err != nil {
+		return err
+	}
+
+	c.send <- msgBytes
 	return nil
 }
