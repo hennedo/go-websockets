@@ -8,13 +8,14 @@ package go_websockets
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"sync"
 	"sync/atomic"
 
 	"github.com/gorilla/websocket"
 	"github.com/hashicorp/go-multierror"
-	"github.com/sirupsen/logrus"
 )
 
 var upgrader = websocket.Upgrader{
@@ -31,7 +32,9 @@ type Callback func(*Client, json.RawMessage)
 // clients.
 type Hub struct {
 	mtx        sync.RWMutex
+	roomMtx    sync.RWMutex
 	clients    map[uint64]*Client
+	rooms	   map[interface{}]*Room
 	callbacks  map[string][]Callback
 	lastID     uint64
 	unregister chan uint64
@@ -40,6 +43,7 @@ type Hub struct {
 func NewHub() *Hub {
 	h := &Hub{
 		clients:    make(map[uint64]*Client),
+		rooms:		make(map[interface{}]*Room),
 		callbacks:  make(map[string][]Callback),
 		unregister: make(chan uint64),
 	}
@@ -68,14 +72,18 @@ func (h *Hub) run() {
 				h.mtx.Lock()
 				delete(h.clients, id)
 				h.mtx.Unlock()
-
-				close(client.send)
+				if client.send != nil {
+					close(client.send)
+				}
+				if client.read != nil {
+					close(client.read)
+				}
 			}
 		}
 	}
 }
 
-func (h *Hub) BroadcastJSON(name string, args interface{}) (result error) {
+func (h *Hub) Broadcast(name string, args interface{}) (result error) {
 	h.mtx.RLock()
 	for _, client := range h.clients {
 		h.mtx.RUnlock()
@@ -89,11 +97,62 @@ func (h *Hub) BroadcastJSON(name string, args interface{}) (result error) {
 	return result
 }
 
+func (h *Hub) BroadcastRoom(name string, room interface{}, args interface{}) (result error) {
+	h.roomMtx.RLock()
+	r, ok := h.rooms[room]
+	if !ok {
+		return errors.New("room does not exist")
+	}
+	h.roomMtx.RUnlock()
+	r.WriteJSON(name, args)
+	return result
+}
+
+func (h *Hub) join(room interface{}, client *Client) {
+	fmt.Printf("room %v", room)
+	h.roomMtx.Lock()
+	defer h.roomMtx.Unlock()
+	_, ok := h.rooms[room]
+	if !ok {
+		fmt.Printf("creating room %v", room)
+		h.rooms[room] = &Room{
+			clients: make(map[uint64]*Client),
+			lock:    sync.RWMutex{},
+		}
+	}
+	fmt.Printf("joining room %v", room)
+	h.rooms[room].join(client)
+}
+
+func (h *Hub) leave(room interface{}, client *Client) {
+	h.roomMtx.RLock()
+	r := h.rooms[room]
+	h.roomMtx.RUnlock()
+	r.leave(client)
+	if len(h.rooms[room].clients) == 0 {
+		h.roomMtx.Lock()
+		delete(h.rooms, room)
+		h.roomMtx.Unlock()
+	}
+}
+
 // ServeWs handles websocket requests from the peer.
 func (h *Hub) ServeWs(w http.ResponseWriter, r *http.Request) {
+	upgrade := false
+	for _, header := range r.Header["Upgrade"] {
+		if header == "websocket" {
+			upgrade = true
+			break
+		}
+	}
+	if !upgrade {
+		w.WriteHeader(200)
+		return
+	}
+
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		logrus.Error(err)
+		fmt.Printf("%s", err)
 		return
 	}
 
@@ -102,6 +161,7 @@ func (h *Hub) ServeWs(w http.ResponseWriter, r *http.Request) {
 		hub:  h,
 		conn: conn,
 		send: make(chan []byte, 256),
+		rooms: make(map[interface{}]struct{}),
 		id:   id,
 	}
 	h.mtx.Lock()
