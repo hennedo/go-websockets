@@ -75,6 +75,9 @@ func (h *Hub) run() {
 func (h *Hub) Broadcast(name string, args interface{}) (result error) {
 	h.mtx.RLock()
 	for _, client := range h.clients {
+		if client == nil {
+			continue
+		}
 		h.mtx.RUnlock()
 		if err := client.WriteJSON(name, args); err != nil {
 			result = multierror.Append(result, err)
@@ -90,6 +93,7 @@ func (h *Hub) BroadcastRoom(name string, room interface{}, args interface{}) (re
 	h.roomMtx.RLock()
 	r, ok := h.rooms[room]
 	if !ok {
+		h.roomMtx.RUnlock()
 		return errors.New("room does not exist")
 	}
 	h.roomMtx.RUnlock()
@@ -98,25 +102,28 @@ func (h *Hub) BroadcastRoom(name string, room interface{}, args interface{}) (re
 }
 
 func (h *Hub) join(room interface{}, client *Client) {
-	fmt.Printf("room %v", room)
+	fmt.Printf("start joining room %v\n", room)
 	h.roomMtx.Lock()
 	defer h.roomMtx.Unlock()
 	_, ok := h.rooms[room]
 	if !ok {
-		fmt.Printf("creating room %v", room)
+		fmt.Printf("creating room %v\n", room)
 		h.rooms[room] = &Room{
 			clients: make(map[uint64]*Client),
 			lock:    sync.RWMutex{},
 		}
 	}
-	fmt.Printf("joining room %v", room)
+	fmt.Printf("joining room %v\n", room)
 	h.rooms[room].join(client)
 }
 
 func (h *Hub) leave(room interface{}, client *Client) {
 	h.roomMtx.RLock()
-	r := h.rooms[room]
+	r, ok := h.rooms[room]
 	h.roomMtx.RUnlock()
+	if !ok {
+		return
+	}
 	r.leave(client)
 	if len(h.rooms[room].clients) == 0 {
 		h.roomMtx.Lock()
