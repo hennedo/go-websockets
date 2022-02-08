@@ -40,6 +40,23 @@ type Hub struct {
 	unregister chan uint64
 }
 
+func (h *Hub) ConnectedClientsCount() (result int) {
+	h.mtx.RLock()
+	clients := len(h.clients)
+	h.mtx.RUnlock()
+	return clients
+}
+
+func (h *Hub) RoomClientsCount(name string) (result int) {
+	h.mtx.RLock()
+	var clients int
+	if h.rooms[name] != nil {
+		clients = len(h.rooms[name].clients)
+	}
+	h.mtx.RUnlock()
+	return clients
+}
+
 func (h *Hub) On(name string, cb Callback) {
 	h.callbacks[name] = append(h.callbacks[name], cb)
 }
