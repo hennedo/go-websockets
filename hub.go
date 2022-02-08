@@ -40,6 +40,17 @@ type Hub struct {
 	unregister chan uint64
 }
 
+func NewHub() *Hub {
+	h := &Hub{
+		clients:    make(map[uint64]*Client),
+		rooms:      make(map[interface{}]*Room),
+		callbacks:  make(map[string][]Callback),
+		unregister: make(chan uint64),
+	}
+	go h.run()
+	return h
+}
+
 func (h *Hub) ConnectedClientsCount() (result int) {
 	h.mtx.RLock()
 	clients := len(h.clients)
