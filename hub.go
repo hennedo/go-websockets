@@ -34,7 +34,7 @@ type Hub struct {
 	mtx        sync.RWMutex
 	roomMtx    sync.RWMutex
 	clients    map[uint64]*Client
-	rooms	   map[interface{}]*Room
+	rooms      map[interface{}]*Room
 	callbacks  map[string][]Callback
 	lastID     uint64
 	unregister chan uint64
@@ -43,12 +43,29 @@ type Hub struct {
 func NewHub() *Hub {
 	h := &Hub{
 		clients:    make(map[uint64]*Client),
-		rooms:		make(map[interface{}]*Room),
+		rooms:      make(map[interface{}]*Room),
 		callbacks:  make(map[string][]Callback),
 		unregister: make(chan uint64),
 	}
 	go h.run()
 	return h
+}
+
+func (h *Hub) ConnectedClientsCount() (result int) {
+	h.mtx.RLock()
+	clients := len(h.clients)
+	h.mtx.RUnlock()
+	return clients
+}
+
+func (h *Hub) RoomClientsCount(name string) (result int) {
+	h.mtx.RLock()
+	var clients int
+	if h.rooms[name] != nil {
+		clients = len(h.rooms[name].clients)
+	}
+	h.mtx.RUnlock()
+	return clients
 }
 
 func (h *Hub) On(name string, cb Callback) {
@@ -165,11 +182,11 @@ func (h *Hub) ServeWs(w http.ResponseWriter, r *http.Request) {
 
 	id := atomic.AddUint64(&h.lastID, 1)
 	client := &Client{
-		hub:  h,
-		conn: conn,
-		send: make(chan []byte, 256),
+		hub:   h,
+		conn:  conn,
+		send:  make(chan []byte, 256),
 		rooms: make(map[interface{}]struct{}),
-		id:   id,
+		id:    id,
 	}
 	h.mtx.Lock()
 	h.clients[id] = client
