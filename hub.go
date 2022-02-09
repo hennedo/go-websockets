@@ -51,21 +51,20 @@ func NewHub() *Hub {
 	return h
 }
 
-func (h *Hub) ConnectedClientsCount() (result int) {
+func (h *Hub) ConnectedClientsCount() int {
 	h.mtx.RLock()
-	clients := len(h.clients)
+	count := len(h.clients)
 	h.mtx.RUnlock()
-	return clients
+	return count
 }
 
-func (h *Hub) RoomClientsCount(name string) (result int) {
+func (h *Hub) RoomClientsCount(name string) (count int) {
 	h.mtx.RLock()
-	var clients int
-	if h.rooms[name] != nil {
-		clients = len(h.rooms[name].clients)
+	if room, ok := h.rooms[name]; ok {
+		count = len(room.clients)
 	}
 	h.mtx.RUnlock()
-	return clients
+	return
 }
 
 func (h *Hub) On(name string, cb Callback) {
