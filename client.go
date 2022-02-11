@@ -7,9 +7,13 @@
 package go_websockets
 
 import (
-	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"log"
+	"net"
 	"sync"
 	"time"
 
@@ -27,45 +31,87 @@ const (
 	pingPeriod = (pongWait * 9) / 10
 )
 
-// Client is a middleman between the websocket connection and the hub.
-type Client struct {
-	hub  *Hub
-	conn *websocket.Conn
-	send chan []byte
-	read chan struct{}
-	rooms map[interface{}]struct{}
+type Client interface {
+	io.Closer
+	Join(room string)
+	Leave(room string)
+	WriteJSON(name string, args interface{}) error
+
+	// SetData allows setting arbitrary data for the client
+	// as example for session management
+	SetData(key string, value interface{})
+
+	// GetData allows fetching arbitrary data for the client
+	// as example for session management
+	GetData(key string) interface{}
+}
+
+var (
+	_ Client = (*hubClient)(nil)
+)
+
+// hubClient is a middleman between the websocket connection and the hub.
+type hubClient struct {
+	hub    *hub
+	conn   *websocket.Conn
+	send   chan []byte
+	ctx    context.Context
+	cancel context.CancelFunc
+
+	id uint64
+
 	roomsMtx sync.RWMutex
-	id   uint64
-	Data	interface{}
+	rooms    map[string]bool
+
+	dataMtx sync.RWMutex
+	data    map[string]interface{}
 }
 
-type RawMessage struct {
-	Type string          `json:"type"`
-	Args json.RawMessage `json:"args"`
+func (c *hubClient) SetData(key string, value interface{}) {
+	c.dataMtx.Lock()
+	c.data[key] = value
+	c.dataMtx.Unlock()
 }
 
-func (c *Client) Close() {
-	c.conn.Close()
+func (c *hubClient) GetData(key string) interface{} {
+	c.dataMtx.RLock()
+	defer c.dataMtx.RUnlock()
+	return c.data[key]
+}
+
+func (c *hubClient) Close() error {
+	c.cancel()
+
 	c.roomsMtx.Lock()
 	for room := range c.rooms {
 		c.hub.leave(room, c)
 	}
 	c.roomsMtx.Unlock()
-	c.hub.unregister <- c.id
+
+	c.hub.unregister(c)
+
+	return c.conn.Close()
 }
 
-func (c *Client) Join(room interface{}) {
-	c.roomsMtx.Lock()
-	defer c.roomsMtx.Unlock()
+func (c *hubClient) Join(room string) {
 	c.hub.join(room, c)
-	c.rooms[room] = struct{}{}
-}
 
-func (c *Client) Leave(room interface{}) {
 	c.roomsMtx.Lock()
 	defer c.roomsMtx.Unlock()
+	c.rooms[room] = true
+}
+
+func (c *hubClient) Leave(room string) {
 	c.hub.leave(room, c)
+
+	c.roomsMtx.Lock()
+	defer c.roomsMtx.Unlock()
 	delete(c.rooms, room)
+}
+
+type IncomingMessage struct {
+	Type string          `json:"type"`
+	Args json.RawMessage `json:"args"`
 }
 
 // readPump pumps messages from the websocket connection to the hub.
@@ -73,40 +119,47 @@ func (c *Client) Leave(room interface{}) {
 // The application runs readPump in a per-connection goroutine. The application
 // ensures that there is at most one reader on a connection by executing all
 // reads from this goroutine.
-func (c *Client) readPump() {
+func (c *hubClient) readPump() {
 	defer c.Close()
 
 	if err := c.conn.SetReadDeadline(time.Now().Add(pongWait)); err != nil {
-		fmt.Errorf("failed setting read deadline: %v", err)
+		log.Printf("failed setting read deadline: %v", err)
 	}
 	c.conn.SetPongHandler(func(string) error {
 		if err := c.conn.SetReadDeadline(time.Now().Add(pongWait)); err != nil {
-			fmt.Errorf("failed setting read deadline: %v", err)
+			return fmt.Errorf("failed setting read deadline: %v", err)
 		}
 		return nil
 	})
 
 	for {
 		select {
-			case _, ok := <- c.read:
-				if !ok {
-					return
-				}
-			default:
+		case <-c.ctx.Done():
+			return
+		default:
 		}
+
 		_, message, err := c.conn.ReadMessage()
 		if err != nil {
-			fmt.Errorf("error: %v", err)
-			break
+			if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
+				return
+			}
+
+			if errors.Is(err, net.ErrClosed) {
+				return
+			}
+
+			log.Printf("reading message: %v", err)
+			return
 		}
 
-		var msg RawMessage
-		err = json.NewDecoder(bytes.NewReader(message)).Decode(&msg)
-		if err != nil {
-			fmt.Errorf("%s", err)
+		var msg IncomingMessage
+		if err := json.Unmarshal(message, &msg); err != nil {
+			fmt.Printf("decoding message: %s", err)
+			continue
 		}
 
-		c.hub.Handle(c, msg.Type, msg.Args)
+		c.hub.handle(c, msg.Type, msg.Args)
 	}
 }
 
@@ -115,20 +168,21 @@ func (c *Client) readPump() {
 // A goroutine running writePump is started for each connection. The
 // application ensures that there is at most one writer to a connection by
 // executing all writes from this goroutine.
-func (c *Client) writePump() {
+func (c *hubClient) writePump() {
 	ticker := time.NewTicker(pingPeriod)
 	defer ticker.Stop()
+	defer close(c.send)
 	defer c.Close()
+	defer clientsCountMetric.Dec()
 
 	for {
 		select {
-		case message, ok := <-c.send:
-			if !ok {
-				// The hub closed the channel.
-				_ = c.conn.WriteMessage(websocket.CloseMessage, []byte{})
-				return
-			}
+		case <-c.ctx.Done():
+			// The hub closed the channel.
+			_ = c.conn.WriteMessage(websocket.CloseMessage, []byte{})
+			return
 
+		case message := <-c.send:
 			w, err := c.conn.NextWriter(websocket.TextMessage)
 			if err != nil {
 				return
@@ -145,31 +199,40 @@ func (c *Client) writePump() {
 			}
 		case <-ticker.C:
 			if err := c.conn.SetWriteDeadline(time.Now().Add(writeWait)); err != nil {
-				fmt.Errorf("failed setting write deadline: %v", err)
+				log.Printf("failed setting write deadline: %v", err)
 				return
 			}
 
 			if err := c.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
-				fmt.Errorf("failed writing message: %v", err)
+				log.Printf("failed writing message: %v", err)
 				return
 			}
 		}
 	}
 }
 
-func (c *Client) WriteJSON(name string, args interface{}) (err error) {
-	msg := RawMessage{
-		Type: name,
-	}
-	msg.Args, err = json.Marshal(args)
+type OutgoingMessage struct {
+	Type string      `json:"type"`
+	Args interface{} `json:"args"`
+}
+
+func (c *hubClient) WriteJSON(type_ string, args interface{}) (err error) {
+	msgBytes, err := json.Marshal(OutgoingMessage{
+		Type: type_,
+		Args: args,
+	})
 	if err != nil {
 		return err
 	}
 
-	msgBytes, err := json.Marshal(msg)
-	if err != nil {
-		return err
-	}
+	defer func() {
+		if e := recover(); e != nil {
+			if err, ok := e.(error); ok && err.Error() == "send on closed channel" {
+				return
+			}
+			err = fmt.Errorf("recovered from exception in WriteJSON: %v", e)
+		}
+	}()
 
 	c.send <- msgBytes
 	return nil

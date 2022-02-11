@@ -7,8 +7,8 @@
 package go_websockets
 
 import (
+	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net/http"
 	"sync"
@@ -16,7 +16,30 @@ import (
 
 	"github.com/gorilla/websocket"
 	"github.com/hashicorp/go-multierror"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 )
+
+var roomsMetric = promauto.NewGaugeVec(prometheus.GaugeOpts{
+	Namespace: "websockets",
+	Subsystem: "hub",
+	Name:      "rooms",
+	Help:      "All rooms and their sizes",
+}, []string{"name"})
+
+var clientsCountMetric = promauto.NewGauge(prometheus.GaugeOpts{
+	Namespace: "websockets",
+	Subsystem: "hub",
+	Name:      "clients",
+	Help:      "The current count of clients",
+})
+
+var clientsTotalMetric = promauto.NewCounter(prometheus.CounterOpts{
+	Namespace: "websockets",
+	Subsystem: "hub",
+	Name:      "clients_total",
+	Help:      "A counter of all ever connected clients",
+})
 
 var upgrader = websocket.Upgrader{
 	ReadBufferSize:  1024,
@@ -26,141 +49,144 @@ var upgrader = websocket.Upgrader{
 	},
 }
 
-type Callback func(*Client, json.RawMessage)
+type Callback func(Client, json.RawMessage)
 
-// Hub maintains the set of active clients and broadcasts messages to the
-// clients.
-type Hub struct {
-	mtx        sync.RWMutex
-	roomMtx    sync.RWMutex
-	clients    map[uint64]*Client
-	rooms      map[interface{}]*Room
-	callbacks  map[string][]Callback
-	lastID     uint64
-	unregister chan uint64
+type Hub interface {
+	BroadcastRoom(room string, type_ string, args interface{}) error
+	Broadcast(type_ string, args interface{}) error
+	ServeWs(w http.ResponseWriter, r *http.Request)
+	On(name string, cb Callback)
 }
 
-func NewHub() *Hub {
-	h := &Hub{
-		clients:    make(map[uint64]*Client),
-		rooms:      make(map[interface{}]*Room),
-		callbacks:  make(map[string][]Callback),
-		unregister: make(chan uint64),
+var (
+	_ Hub = (*hub)(nil)
+)
+
+// hub maintains the set of active clients and broadcasts messages to the
+// clients.
+type hub struct {
+	roomMtx sync.RWMutex
+	rooms   map[string]*hubRoom
+
+	clientMutex sync.RWMutex
+	clients     map[uint64]*hubClient
+
+	callbackMutex sync.RWMutex
+	callbacks     map[string][]Callback
+
+	lastID uint64
+}
+
+func NewHub() Hub {
+	h := &hub{
+		clients:   make(map[uint64]*hubClient),
+		rooms:     make(map[string]*hubRoom),
+		callbacks: make(map[string][]Callback),
 	}
-	go h.run()
 	return h
 }
 
-func (h *Hub) ConnectedClientsCount() int {
-	h.mtx.RLock()
-	count := len(h.clients)
-	h.mtx.RUnlock()
-	return count
-}
-
-func (h *Hub) RoomClientsCount(name string) (count int) {
-	h.mtx.RLock()
-	if room, ok := h.rooms[name]; ok {
-		count = len(room.clients)
-	}
-	h.mtx.RUnlock()
-	return
-}
-
-func (h *Hub) On(name string, cb Callback) {
+func (h *hub) On(name string, cb Callback) {
+	h.callbackMutex.Lock()
 	h.callbacks[name] = append(h.callbacks[name], cb)
+	h.callbackMutex.Unlock()
 }
 
-func (h *Hub) Handle(client *Client, name string, msg json.RawMessage) {
+func (h *hub) handle(client *hubClient, name string, msg json.RawMessage) {
+	h.callbackMutex.RLock()
 	for _, cb := range h.callbacks[name] {
 		cb(client, msg)
 	}
+	h.callbackMutex.RUnlock()
 }
 
-func (h *Hub) run() {
-	for {
-		select {
-		case id := <-h.unregister:
-			h.mtx.RLock()
-			client, ok := h.clients[id]
-			h.mtx.RUnlock()
-			if ok {
-				h.mtx.Lock()
-				delete(h.clients, id)
-				h.mtx.Unlock()
-				if client.send != nil {
-					close(client.send)
-				}
-				if client.read != nil {
-					close(client.read)
-				}
-			}
-		}
-	}
+func (h *hub) unregister(c *hubClient) {
+	h.clientMutex.Lock()
+	delete(h.clients, c.id)
+	h.clientMutex.Unlock()
 }
 
-func (h *Hub) Broadcast(name string, args interface{}) (result error) {
-	h.mtx.RLock()
+func (h *hub) Broadcast(type_ string, args interface{}) error {
+	var group multierror.Group
+
+	h.clientMutex.RLock()
 	for _, client := range h.clients {
-		if client == nil {
-			continue
-		}
-		h.mtx.RUnlock()
-		if err := client.WriteJSON(name, args); err != nil {
-			result = multierror.Append(result, err)
-		}
-		h.mtx.RLock()
+		group.Go(func() error {
+			return client.WriteJSON(type_, args)
+		})
 	}
-	h.mtx.RUnlock()
+	h.clientMutex.RUnlock()
 
-	return result
+	return group.Wait().ErrorOrNil()
 }
 
-func (h *Hub) BroadcastRoom(name string, room interface{}, args interface{}) (result error) {
+func (h *hub) BroadcastRoom(room string, type_ string, args interface{}) error {
 	h.roomMtx.RLock()
-	r, ok := h.rooms[room]
-	if !ok {
+
+	if r, ok := h.rooms[room]; ok {
 		h.roomMtx.RUnlock()
-		return errors.New("room does not exist")
+		return r.writeJSON(type_, args)
 	}
+
 	h.roomMtx.RUnlock()
-	r.WriteJSON(name, args)
-	return result
+
+	return nil
 }
 
-func (h *Hub) join(room interface{}, client *Client) {
-	fmt.Printf("start joining room %v\n", room)
+//room count, room names, und ggf all client counts of all rooms (mapped name=>count) bräucht ich da noch :D/
+
+type Metrics struct {
+	clients int
+	rooms   int
+}
+
+func (h *hub) Metrics() Metrics {
+	return Metrics{
+		clients: len(h.clients),
+		rooms:   len(h.rooms),
+	}
+}
+
+func (h *hub) join(room string, client *hubClient) {
 	h.roomMtx.Lock()
-	defer h.roomMtx.Unlock()
-	_, ok := h.rooms[room]
+
+	r, ok := h.rooms[room]
 	if !ok {
 		fmt.Printf("creating room %v\n", room)
-		h.rooms[room] = &Room{
-			clients: make(map[uint64]*Client),
+		r = &hubRoom{
+			clients: make(map[uint64]*hubClient),
 			lock:    sync.RWMutex{},
 		}
+		h.rooms[room] = r
 	}
-	fmt.Printf("joining room %v\n", room)
-	h.rooms[room].join(client)
+
+	h.roomMtx.Unlock()
+
+	r.join(client)
+	roomsMetric.WithLabelValues(room).Inc()
 }
 
-func (h *Hub) leave(room interface{}, client *Client) {
+func (h *hub) leave(room string, client *hubClient) {
 	h.roomMtx.RLock()
 	r, ok := h.rooms[room]
 	h.roomMtx.RUnlock()
+
 	if !ok {
 		return
 	}
+
 	r.leave(client)
-	if len(h.rooms[room].clients) == 0 {
+	roomsMetric.WithLabelValues(room).Dec()
+	if len(r.clients) == 0 {
 		h.roomMtx.Lock()
 		delete(h.rooms, room)
 		h.roomMtx.Unlock()
+		roomsMetric.DeleteLabelValues(room)
 	}
 }
 
 // ServeWs handles websocket requests from the peer.
-func (h *Hub) ServeWs(w http.ResponseWriter, r *http.Request) {
+func (h *hub) ServeWs(w http.ResponseWriter, r *http.Request) {
 	upgrade := false
 	for _, header := range r.Header["Upgrade"] {
 		if header == "websocket" {
@@ -169,7 +195,7 @@ func (h *Hub) ServeWs(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if !upgrade {
-		w.WriteHeader(200)
+		w.WriteHeader(http.StatusOK)
 		return
 	}
 
@@ -179,17 +205,22 @@ func (h *Hub) ServeWs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	ctx, cancel := context.WithCancel(context.Background())
 	id := atomic.AddUint64(&h.lastID, 1)
-	client := &Client{
-		hub:   h,
-		conn:  conn,
-		send:  make(chan []byte, 256),
-		rooms: make(map[interface{}]struct{}),
-		id:    id,
+	client := &hubClient{
+		hub:    h,
+		conn:   conn,
+		send:   make(chan []byte, 256),
+		rooms:  make(map[string]bool),
+		id:     id,
+		ctx:    ctx,
+		cancel: cancel,
 	}
-	h.mtx.Lock()
+	h.clientMutex.Lock()
 	h.clients[id] = client
-	h.mtx.Unlock()
+	h.clientMutex.Unlock()
+	clientsTotalMetric.Inc()
+	clientsCountMetric.Inc()
 
 	// Allow collection of memory referenced by the caller by doing all work in
 	// new goroutines.

@@ -1,30 +1,41 @@
 package go_websockets
 
 import (
+	"github.com/hashicorp/go-multierror"
 	"sync"
 )
 
-type Room struct {
-	clients map[uint64]*Client
-	lock sync.RWMutex
+type hubRoom struct {
+	clients map[uint64]*hubClient
+	lock    sync.RWMutex
 }
 
-func (r *Room) join(client *Client) {
+func (r *hubRoom) join(client *hubClient) {
 	r.lock.Lock()
 	r.clients[client.id] = client
 	r.lock.Unlock()
 }
 
-func (r *Room) leave(client *Client) {
+func (r *hubRoom) leave(client *hubClient) {
 	r.lock.Lock()
 	delete(r.clients, client.id)
 	r.lock.Unlock()
 }
 
-func (r *Room) WriteJSON(name string, args interface{}) {
+func (r *hubRoom) clientsCount() int {
+	return len(r.clients)
+}
+
+func (r *hubRoom) writeJSON(type_ string, args interface{}) error {
+	var group multierror.Group
+
 	r.lock.RLock()
-	defer r.lock.RUnlock()
 	for _, client := range r.clients {
-		client.WriteJSON(name, args)
+		group.Go(func() error {
+			return client.WriteJSON(type_, args)
+		})
 	}
+	r.lock.RUnlock()
+
+	return group.Wait().ErrorOrNil()
 }
