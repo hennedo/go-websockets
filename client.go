@@ -36,6 +36,7 @@ type Client interface {
 	Join(room string)
 	Leave(room string)
 	WriteJSON(name string, args interface{}) error
+	Context() context.Context
 
 	// SetData allows setting arbitrary data for the client
 	// as example for session management
@@ -65,6 +66,10 @@ type hubClient struct {
 
 	dataMtx sync.RWMutex
 	data    map[string]interface{}
+}
+
+func (c *hubClient) Context() context.Context {
+	return c.ctx
 }
 
 func (c *hubClient) SetData(key string, value interface{}) {
