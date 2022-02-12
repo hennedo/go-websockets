@@ -54,7 +54,7 @@ type Callback func(Client, json.RawMessage)
 type Hub interface {
 	BroadcastRoom(room string, type_ string, args interface{}) error
 	Broadcast(type_ string, args interface{}) error
-	ServeWs(w http.ResponseWriter, r *http.Request)
+	ServeHTTP(w http.ResponseWriter, r *http.Request)
 	On(name string, cb Callback)
 }
 
@@ -74,14 +74,27 @@ type hub struct {
 	callbackMutex sync.RWMutex
 	callbacks     map[string][]Callback
 
-	lastID uint64
+	lastID       uint64
+	onConnect    func(Client)
+	onDisconnect func(Client)
 }
 
-func NewHub() Hub {
+type Options struct {
+	OnConnect    func(Client)
+	OnDisconnect func(Client)
+}
+
+func NewHub(opt *Options) Hub {
+	if opt == nil {
+		opt = &Options{}
+	}
+
 	h := &hub{
-		clients:   make(map[uint64]*hubClient),
-		rooms:     make(map[string]*hubRoom),
-		callbacks: make(map[string][]Callback),
+		clients:      make(map[uint64]*hubClient),
+		rooms:        make(map[string]*hubRoom),
+		callbacks:    make(map[string][]Callback),
+		onConnect:    opt.OnConnect,
+		onDisconnect: opt.OnDisconnect,
 	}
 	return h
 }
@@ -185,8 +198,8 @@ func (h *hub) leave(room string, client *hubClient) {
 	}
 }
 
-// ServeWs handles websocket requests from the peer.
-func (h *hub) ServeWs(w http.ResponseWriter, r *http.Request) {
+// ServeHTTP handles websocket requests from the peer.
+func (h *hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	upgrade := false
 	for _, header := range r.Header["Upgrade"] {
 		if header == "websocket" {
@@ -221,6 +234,8 @@ func (h *hub) ServeWs(w http.ResponseWriter, r *http.Request) {
 	h.clientMutex.Unlock()
 	clientsTotalMetric.Inc()
 	clientsCountMetric.Inc()
+
+	h.onConnect(client)
 
 	// Allow collection of memory referenced by the caller by doing all work in
 	// new goroutines.
