@@ -115,6 +115,9 @@ func (h *hub) handle(client *hubClient, name string, msg json.RawMessage) {
 
 func (h *hub) unregister(c *hubClient) {
 	h.clientMutex.Lock()
+	if h.onDisconnect != nil {
+		h.onDisconnect(c)
+	}
 	delete(h.clients, c.id)
 	h.clientMutex.Unlock()
 }
@@ -235,7 +238,9 @@ func (h *hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	clientsTotalMetric.Inc()
 	clientsCountMetric.Inc()
 
-	h.onConnect(client)
+	if h.onConnect != nil {
+		h.onConnect(client)
+	}
 
 	// Allow collection of memory referenced by the caller by doing all work in
 	// new goroutines.

@@ -94,7 +94,6 @@ func (c *hubClient) Close() error {
 	c.roomsMtx.Unlock()
 
 	c.hub.unregister(c)
-	c.hub.onDisconnect(c)
 
 	return c.conn.Close()
 }
