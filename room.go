@@ -1,6 +1,7 @@
 package go_websockets
 
 import (
+	"fmt"
 	"github.com/hashicorp/go-multierror"
 	"sync"
 )
@@ -10,16 +11,24 @@ type hubRoom struct {
 	lock    sync.RWMutex
 }
 
-func (r *hubRoom) join(client *hubClient) {
+func (r *hubRoom) join(client *hubClient) error {
 	r.lock.Lock()
+	defer r.lock.Unlock()
+	if _, ok := r.clients[client.id]; ok {
+		return fmt.Errorf("client already joined")
+	}
 	r.clients[client.id] = client
-	r.lock.Unlock()
+	return nil
 }
 
-func (r *hubRoom) leave(client *hubClient) {
+func (r *hubRoom) leave(client *hubClient) error {
 	r.lock.Lock()
+	defer r.lock.Unlock()
+	if _, ok := r.clients[client.id]; !ok {
+		return fmt.Errorf("client not joined")
+	}
 	delete(r.clients, client.id)
-	r.lock.Unlock()
+	return nil
 }
 
 func (r *hubRoom) clientsCount() int {

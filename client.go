@@ -33,8 +33,8 @@ const (
 
 type Client interface {
 	io.Closer
-	Join(room string)
-	Leave(room string)
+	Join(room string) error
+	Leave(room string) error
 	WriteJSON(name string, args interface{}) error
 	Context() context.Context
 
@@ -89,7 +89,12 @@ func (c *hubClient) Close() error {
 
 	c.roomsMtx.Lock()
 	for room := range c.rooms {
-		c.hub.leave(room, c)
+		err := c.hub.leave(room, c)
+		if err != nil {
+			fmt.Printf("error leaving room on client close: %v\n", err)
+		}
+		// even if we're closing this client, prevent exiting from rooms multiple times
+		delete(c.rooms, room)
 	}
 	c.roomsMtx.Unlock()
 
@@ -98,20 +103,28 @@ func (c *hubClient) Close() error {
 	return c.conn.Close()
 }
 
-func (c *hubClient) Join(room string) {
-	c.hub.join(room, c)
+func (c *hubClient) Join(room string) error {
+	err := c.hub.join(room, c)
+	if err != nil {
+		return err
+	}
 
 	c.roomsMtx.Lock()
 	defer c.roomsMtx.Unlock()
 	c.rooms[room] = true
+	return nil
 }
 
-func (c *hubClient) Leave(room string) {
-	c.hub.leave(room, c)
+func (c *hubClient) Leave(room string) error {
+	err := c.hub.leave(room, c)
+	if err != nil {
+		return err
+	}
 
 	c.roomsMtx.Lock()
 	defer c.roomsMtx.Unlock()
 	delete(c.rooms, room)
+	return nil
 }
 
 type IncomingMessage struct {

@@ -163,12 +163,11 @@ func (h *hub) Metrics() Metrics {
 	}
 }
 
-func (h *hub) join(room string, client *hubClient) {
+func (h *hub) join(room string, client *hubClient) error {
 	h.roomMtx.Lock()
 
 	r, ok := h.rooms[room]
 	if !ok {
-		fmt.Printf("creating room %v\n", room)
 		r = &hubRoom{
 			clients: make(map[uint64]*hubClient),
 			lock:    sync.RWMutex{},
@@ -178,20 +177,26 @@ func (h *hub) join(room string, client *hubClient) {
 
 	h.roomMtx.Unlock()
 
-	r.join(client)
+	err := r.join(client)
+	if err != nil {
+		return err
+	}
 	roomsMetric.WithLabelValues(room).Inc()
+	return nil
 }
 
-func (h *hub) leave(room string, client *hubClient) {
+func (h *hub) leave(room string, client *hubClient) error {
 	h.roomMtx.RLock()
 	r, ok := h.rooms[room]
 	h.roomMtx.RUnlock()
-
 	if !ok {
-		return
+		return fmt.Errorf("room does not exist")
 	}
 
-	r.leave(client)
+	err := r.leave(client)
+	if err != nil {
+		return err
+	}
 	roomsMetric.WithLabelValues(room).Dec()
 	if len(r.clients) == 0 {
 		h.roomMtx.Lock()
@@ -199,6 +204,7 @@ func (h *hub) leave(room string, client *hubClient) {
 		h.roomMtx.Unlock()
 		roomsMetric.DeleteLabelValues(room)
 	}
+	return nil
 }
 
 // ServeHTTP handles websocket requests from the peer.
