@@ -40,8 +40,10 @@ func (r *hubRoom) writeJSON(type_ string, args interface{}) error {
 
 	r.lock.RLock()
 	for _, client := range r.clients {
+		// set client again, so the pointer does not get overwritten when it's finally executed..
+		client_ := client
 		group.Go(func() error {
-			return client.WriteJSON(type_, args)
+			return client_.WriteJSON(type_, args)
 		})
 	}
 	r.lock.RUnlock()

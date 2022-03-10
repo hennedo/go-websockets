@@ -127,8 +127,10 @@ func (h *hub) Broadcast(type_ string, args interface{}) error {
 
 	h.clientMutex.RLock()
 	for _, client := range h.clients {
+		// set client again, so the pointer does not get overwritten when it's finally executed..
+		client_ := client
 		group.Go(func() error {
-			return client.WriteJSON(type_, args)
+			return client_.WriteJSON(type_, args)
 		})
 	}
 	h.clientMutex.RUnlock()
