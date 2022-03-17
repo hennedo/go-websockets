@@ -236,6 +236,7 @@ func (h *hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		conn:   conn,
 		send:   make(chan []byte, 256),
 		rooms:  make(map[string]bool),
+		data:	make(map[string]interface{}),
 		id:     id,
 		ctx:    ctx,
 		cancel: cancel,

@@ -45,6 +45,11 @@ type Client interface {
 	// GetData allows fetching arbitrary data for the client
 	// as example for session management
 	GetData(key string) interface{}
+
+	// Equals allows for comparing clients
+	Equals(client Client) bool
+
+	GetID() uint64
 }
 
 var (
@@ -70,6 +75,14 @@ type hubClient struct {
 
 func (c *hubClient) Context() context.Context {
 	return c.ctx
+}
+
+func (c *hubClient) Equals(client Client) bool {
+	return c.id == client.GetID()
+}
+
+func (c *hubClient) GetID() uint64 {
+	return c.id
 }
 
 func (c *hubClient) SetData(key string, value interface{}) {
